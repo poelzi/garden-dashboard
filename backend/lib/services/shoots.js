@@ -220,7 +220,7 @@ exports.info = async function ({ user, namespace, name }) {
     seed = getSeed(getSeedNameFromShoot(shoot))
     const prefix = _.replace(shoot.status.technicalID, /^shoot--/, '')
     if (prefix) {
-      const ingressDomain = _.get(seed, 'spec.dns.ingressDomain')
+      const ingressDomain = _.get(seed, 'spec.dns.ingressDomain') || _.get(seed, 'spec.ingress.domain')
       if (ingressDomain) {
         data.seedShootIngressDomain = `${prefix}.${ingressDomain}`
       }

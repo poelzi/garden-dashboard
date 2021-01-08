@@ -8,6 +8,7 @@
 'use strict'
 const Queue = require('better-queue')
 const _ = require('lodash')
+const hash = require('object-hash')
 const net = require('net')
 const moment = require('moment')
 
@@ -21,7 +22,8 @@ const { dashboardClient } = require('@gardener-dashboard/kube-client')
 const {
   getConfigValue,
   getSeedNameFromShoot,
-  isSeedUnreachable
+  isSeedUnreachable,
+  seedIngressDomain
 } = require('../../utils')
 
 const {
@@ -43,38 +45,61 @@ const { getSeed } = require('../../cache')
 
 const TERMINAL_KUBE_APISERVER = 'dashboard-terminal-kube-apiserver'
 
+const BootstrapEnum = {
+  SEED_DETERMINATION_FAILED: -3,
+  IGNORED: -2, // resource excluded from bootstrapping, deleted or not yet ready to be bootstrapped
+  BOOTSTRAP_POSTPONED: -1,
+  BOOTSTRAPPED: 0,
+  BOOTSTRAP_REQUIRED_NOT_YET_BOOTSTRAPPED: 1,
+  BOOTSTRAP_REQUIRED_REVISION_CHANGED: 2
+}
+
 // acts as abstract class
-class BootstrapSet extends Set {
+class BootstrapMap {
   containsResource (resource) {
-    const key = this.constructor.keyForResource(resource)
-    return this.has(key)
+    const key = this.keyForResource(resource)
+    return _.has(this, key)
   }
 
   removeResource (resource) {
-    const key = this.constructor.keyForResource(resource)
-    return this.delete(key)
+    const key = this.keyForResource(resource)
+    delete this[key]
   }
 
-  addResource (resource) {
-    const key = this.constructor.keyForResource(resource)
-    return this.addResourceWithKey(key)
+  removeBy (predicate) {
+    const keysToBeRemoved = _
+      .chain(this)
+      .pickBy(predicate)
+      .keys()
+      .value()
+
+    _.forEach(keysToBeRemoved, key => {
+      delete this[key]
+    })
+    return keysToBeRemoved
   }
 
-  addResourceWithKey (key) {
-    this.add(key)
+  addResource (resource, value = {}) {
+    const key = this.keyForResource(resource)
+    this[key] = value
     return key
+  }
+
+  valueForResource (resource) {
+    const key = this.keyForResource(resource)
+    return this[key]
   }
 }
 
-class NamedKeyBootstrapSet extends BootstrapSet {
-  static keyForResource (resource) {
+class NamedKeyBootstrapMap extends BootstrapMap {
+  keyForResource (resource) {
     const { kind, metadata: { name, namespace } } = resource
     return `${kind}/${namespace}/${name}`
   }
 }
 
-class UidKeyBootstrapSet extends BootstrapSet {
-  static keyForResource (resource) {
+class UidKeyBootstrapMap extends BootstrapMap {
+  keyForResource (resource) {
     const { metadata: { uid } } = resource
     return uid
   }
@@ -83,6 +108,36 @@ class UidKeyBootstrapSet extends BootstrapSet {
 function taskIdForResource (resource) {
   const { metadata: { uid } } = resource
   return uid
+}
+
+async function getSeedFromCache (kind, name, namespace) {
+  switch (kind) {
+    case 'Seed': {
+      return getSeed(name)
+    }
+    case 'Shoot': {
+      const shootResource = await dashboardClient['core.gardener.cloud'].shoots.get(namespace, name)
+      const seedName = getSeedNameFromShoot(shootResource)
+      return getSeed(seedName)
+    }
+  }
+}
+
+function bootstrapRevision (seed) {
+  if (!seed) {
+    return
+  }
+
+  const ingressClass = _.get(seed, 'metadata.annotations["seed.gardener.cloud/ingress-class"]')
+  const ingressDomain = seedIngressDomain(seed)
+  const trigger = _.get(seed, 'metadata.labels.["dashboard.gardener.cloud/terminal-bootstrap-trigger"]')
+
+  const revisionObj = {
+    ingressClass,
+    ingressDomain,
+    trigger
+  }
+  return hash(revisionObj)
 }
 
 class Handler {
@@ -290,6 +345,12 @@ async function ensureTrustedCertForShootApiServer (client, shootResource) {
 
   const serviceName = 'kube-apiserver'
   const annotations = _.get(config, 'terminal.bootstrap.apiServerIngress.annotations')
+
+  const ingressClass = _.get(seedResource, 'metadata.annotations["seed.gardener.cloud/ingress-class"]')
+  if (ingressClass && annotations) {
+    annotations['kubernetes.io/ingress.class'] = ingressClass
+  }
+
   await replaceIngressApiServer(seedClient, {
     namespace: seedShootNamespace,
     serviceName,
@@ -344,6 +405,12 @@ async function ensureTrustedCertForSeedApiServer (client, seed) {
   const apiServerIngressHost = getKubeApiServerHostForSeed(seed)
   const seedWildcardIngressDomain = getWildcardIngressDomainForSeed(seed)
   const ingressAnnotations = _.get(config, 'terminal.bootstrap.apiServerIngress.annotations')
+
+  const ingressClass = _.get(seed, 'metadata.annotations["seed.gardener.cloud/ingress-class"]')
+  if (ingressClass && ingressAnnotations) {
+    ingressAnnotations['kubernetes.io/ingress.class'] = ingressClass
+  }
+
   await ensureTrustedCertForApiServer(seedClient, {
     namespace,
     name: `${TERMINAL_KUBE_APISERVER}-${seedName}`,
@@ -424,8 +491,8 @@ function verifyRequiredConfigExists () {
 class Bootstrapper extends Queue {
   constructor () {
     super(Bootstrapper.process, Bootstrapper.options)
-    this.bootstrapPending = new NamedKeyBootstrapSet()
-    this.bootstrapped = new UidKeyBootstrapSet()
+    this.bootstrapPending = new NamedKeyBootstrapMap()
+    this.bootstrapped = new UidKeyBootstrapMap()
     this.requiredConfigExists = verifyRequiredConfigExists()
     if (this.isBootstrapKindAllowed('gardenTerminalHost')) {
       const description = 'garden host cluster'
@@ -452,15 +519,21 @@ class Bootstrapper extends Queue {
 
   handleResourceEvent ({ type, object }) {
     switch (type) {
-      case 'ADDED':
+      case 'ADDED': {
         this.bootstrapResource(object)
         break
-      case 'MODIFIED':
-        if (this.isResourcePending(object)) {
-          this.bootstrapResource(object)
+      }
+      case 'MODIFIED': {
+        const status = this.bootstrapStatus(object)
+        const bootstrapRequired =
+          BootstrapEnum.BOOTSTRAP_REQUIRED_NOT_YET_BOOTSTRAPPED === status ||
+           BootstrapEnum.BOOTSTRAP_REQUIRED_REVISION_CHANGED === status
+        if (bootstrapRequired) {
+          this.bootstrapResourceWithStatus(object, status)
         }
         break
-      case 'DELETED':
+      }
+      case 'DELETED': {
         this.cancelTask(object)
 
         if (this.isResourcePending(object)) {
@@ -470,6 +543,7 @@ class Bootstrapper extends Queue {
           this.removeBootstrappedResource(object)
         }
         break
+      }
     }
   }
 
@@ -494,47 +568,106 @@ class Bootstrapper extends Queue {
     return this.bootstrapPending.removeResource(resource)
   }
 
-  bootstrapResource (resource) {
-    const { kind, metadata: { namespace, name, uid } } = resource
-
-    const qualifiedName = namespace ? namespace + '/' + name : name
-    const description = `${kind} - ${qualifiedName} (${uid})`
+  bootstrapStatus (resource) {
+    const { kind } = resource
 
     if (!this.isBootstrapKindAllowed(kind)) {
-      return
+      return BootstrapEnum.IGNORED
     }
 
     // do not bootstrap if resource is beeing deleted
     if (!_.isEmpty(resource.metadata.deletionTimestamp)) {
-      return
+      return BootstrapEnum.IGNORED
     }
 
     const isBootstrapDisabledForResource = _.get(resource, ['metadata', 'annotations', 'dashboard.gardener.cloud/terminal-bootstrap-disabled'], 'false') === 'true'
     if (isBootstrapDisabledForResource) {
-      logger.debug(`terminal bootstrap disabled for ${description}`)
-      return
-    }
-
-    if (this.bootstrapped.containsResource(resource)) {
-      logger.debug(`terminal bootstrap already executed for ${description}`)
-      return
+      return BootstrapEnum.IGNORED
     }
 
     // for shoots, if the seed-shoot-ns does not exist, postpone bootstrapping
     if (kind === 'Shoot' && !seedShootNamespaceExists(resource)) {
       if (this.bootstrapPending.containsResource(resource)) {
-        return
+        return BootstrapEnum.IGNORED
       }
-      this.bootstrapPending.addResource(resource)
-      logger.debug(`bootstrapping of ${description} postponed`)
-      return
+      return BootstrapEnum.BOOTSTRAP_POSTPONED
+    }
+
+    const value = this.bootstrapped.valueForResource(resource)
+    if (!value || !value.revision) {
+      return BootstrapEnum.BOOTSTRAP_REQUIRED_NOT_YET_BOOTSTRAPPED
+    }
+
+    // determine seed
+    let seed
+    switch (kind) {
+      case 'Seed': {
+        seed = resource
+        break
+      }
+      case 'Shoot': {
+        const seedName = getSeedNameFromShoot(resource)
+        seed = getSeed(seedName)
+        break
+      }
+    }
+
+    if (!seed) {
+      return BootstrapEnum.SEED_DETERMINATION_FAILED
+    }
+
+    if (value.revision !== bootstrapRevision(seed)) {
+      return BootstrapEnum.BOOTSTRAP_REQUIRED_REVISION_CHANGED
+    }
+
+    return BootstrapEnum.BOOTSTRAPPED
+  }
+
+  bootstrapResource (resource) {
+    const status = this.bootstrapStatus(resource)
+    this.bootstrapResourceWithStatus(resource, status)
+  }
+
+  bootstrapResourceWithStatus (resource, status) {
+    const { kind, metadata: { namespace, name, uid } } = resource
+
+    const qualifiedName = namespace ? namespace + '/' + name : name
+    const description = `${kind} - ${qualifiedName} (${uid})`
+
+    switch (status) {
+      case BootstrapEnum.IGNORED:
+        return // skip
+      case BootstrapEnum.SEED_DETERMINATION_FAILED:
+        logger.debug(`could not determine seed for ${description}. Failed to bootstrap`)
+        return // skip
+      case BootstrapEnum.BOOTSTRAPPED:
+        logger.debug(`terminal bootstrap already executed for ${description}`)
+        return // skip
+      case BootstrapEnum.BOOTSTRAP_POSTPONED:
+        this.bootstrapPending.addResource(resource)
+        logger.debug(`bootstrapping of ${description} postponed`)
+        return // skip
+      case BootstrapEnum.BOOTSTRAP_REQUIRED_REVISION_CHANGED:
+        logger.debug(`terminal bootstrap revision changed for ${description}. Needs bootstrap`)
+
+        if (kind === 'Seed') {
+          const removed = this.bootstrapped.removeBy(['seedName', name])
+          logger.debug(`Cleared ${removed.length} bootstrapped resources related to seed ${name}`)
+        }
+        break // continue
+      case BootstrapEnum.BOOTSTRAP_REQUIRED_NOT_YET_BOOTSTRAPPED:
+        break // continue
+      default:
+        logger.debug(`unknown bootstrap status ${status}`)
+        return // skip
     }
 
     if (this.bootstrapPending.containsResource(resource)) {
       this.bootstrapPending.removeResource(resource)
     }
 
-    const key = UidKeyBootstrapSet.keyForResource(resource)
+    const key = this.bootstrapped.keyForResource(resource)
+    const bootstrapPendingKey = this.bootstrapPending.keyForResource(resource)
     const taskId = taskIdForResource(resource)
     const fn = async session => {
       if (session.canceled) {
@@ -545,6 +678,17 @@ class Bootstrapper extends Queue {
       switch (kind) {
         case 'Seed': {
           await handleSeed({ name })
+
+          if (BootstrapEnum.BOOTSTRAP_REQUIRED_REVISION_CHANGED === status) {
+            const query = {
+              fieldSelector: `spec.seedName=${name}`
+            }
+            const { items } = await dashboardClient['core.gardener.cloud'].shoots.listAllNamespaces(query)
+            _.forEach(items, shoot => {
+              shoot.kind = 'Shoot' // patch missing kind
+              this.bootstrapResource(shoot)
+            })
+          }
           break
         }
         case 'Shoot': {
@@ -561,8 +705,20 @@ class Bootstrapper extends Queue {
         logger.debug(`Canceling handler of ${description} as requested after handling resource`)
         return
       }
+
+      const seed = await getSeedFromCache(kind, name, namespace)
+      if (!seed) {
+        logger.debug(`failed to get seed after successful bootstrap of ${description}`)
+        return
+      }
+
       logger.debug(`Successfully bootstrapped ${description}`)
-      this.bootstrapped.addResourceWithKey(key)
+      const revision = bootstrapRevision(seed)
+      this.bootstrapped[key] = {
+        revision,
+        seedName: seed.metadata.name
+      }
+      delete this.bootstrapPending[bootstrapPendingKey]
     }
     const handler = new Handler(fn, {
       id: taskId, // with the id we make sure that the task for one shoot is not added multiple times (e.g. on another ADDED event when the shoot watch is re-established)
