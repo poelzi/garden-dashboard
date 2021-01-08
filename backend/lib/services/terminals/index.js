@@ -10,11 +10,9 @@ const _ = require('lodash')
 const hash = require('object-hash')
 const yaml = require('js-yaml')
 const config = require('../../config')
-const pTimeout = require('p-timeout')
 
 const { Forbidden, UnprocessableEntity } = require('http-errors')
 const { isHttpError } = require('@gardener-dashboard/request')
-const { dashboardClient } = require('@gardener-dashboard/kube-client')
 const cache = require('../../cache')
 
 const {
@@ -757,15 +755,8 @@ async function listShortcuts ({ user, namespace }) {
 }
 
 async function resumeBootstrapperAfterCacheSynchronization (bootstrapper) {
-  const begin = Date.now()
-  try {
-    await pTimeout(cache.synchronize(dashboardClient), 60 * 1000)
-    const synchronizationDuration = Date.now() - begin
-    logger.debug('Terminal: Initial cache synchronization succeeded after %d ms', synchronizationDuration)
-  } catch (err) {
-    logger.warn('Terminal: Initial cache synchronization timed out with: %s', err.message, err.stack)
-  }
-
+  await cache.synchronizationPromise
+  logger.debug('terminal bootstrapper resumed')
   bootstrapper.resume()
 }
 
@@ -773,6 +764,5 @@ const bootstrapper = new Bootstrapper()
 bootstrapper.pause()
 
 resumeBootstrapperAfterCacheSynchronization(bootstrapper)
-
 
 exports.bootstrapper = bootstrapper
