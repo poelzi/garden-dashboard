@@ -37,7 +37,8 @@ const {
 
 const {
   Handler,
-  Bootstrapper
+  Bootstrapper,
+  BootstrapStatusEnum
 } = require('../lib/services/terminals/terminalBootstrap')
 
 const {
@@ -769,7 +770,7 @@ describe('services', function () {
         bootstrapper.push(new Handler(() => {}, { description: 'test' }))
         bootstrapper.bootstrapResource(seed)
         bootstrapper.bootstrapResource(shootList[0])
-        await pEvent(bootstrapper, 'empty')
+        await pEvent(bootstrapper, 'drain')
         const stats = bootstrapper.getStats()
         expect(stats.total).toBe(1)
         expect(stats.successRate).toBe(1)
@@ -787,7 +788,7 @@ describe('services', function () {
         }
         terminalStub.mockReturnValue(createTerminalConfig({ gardenTerminalHost, bootstrap }))
         const bootstrapper = new Bootstrapper()
-        await pEvent(bootstrapper, 'empty')
+        await pEvent(bootstrapper, 'drain')
         const stats = bootstrapper.getStats()
         expect(stats.total).toBe(1)
         expect(stats.successRate).toBe(1)
@@ -805,7 +806,7 @@ describe('services', function () {
         terminalStub.mockReturnValue(createTerminalConfig({ gardenTerminalHost, bootstrap }))
         const bootstrapper = new Bootstrapper()
         bootstrapper.bootstrapResource(seed)
-        await pEvent(bootstrapper, 'empty')
+        await pEvent(bootstrapper, 'drain')
         const stats = bootstrapper.getStats()
         expect(stats.total).toBe(1)
         expect(stats.successRate).toBe(1)
@@ -825,7 +826,7 @@ describe('services', function () {
         terminalStub.mockReturnValue(createTerminalConfig({ gardenTerminalHost, bootstrap }))
         const bootstrapper = new Bootstrapper()
         bootstrapper.bootstrapResource(seed)
-        await pEvent(bootstrapper, 'empty')
+        await pEvent(bootstrapper, 'drain')
         const stats = bootstrapper.getStats()
         expect(stats.total).toBe(1)
         expect(stats.successRate).toBe(1)
@@ -845,14 +846,15 @@ describe('services', function () {
         for (const shoot of shootList) {
           bootstrapper.bootstrapResource(shoot)
         }
-        await pEvent(bootstrapper, 'empty')
+        await pEvent(bootstrapper, 'drain')
         const stats = bootstrapper.getStats()
-        expect(bootstrapper.isResourcePending(shootList[0])).toBe(true)
+        expect(bootstrapper.bootstrapState.getValueForResource(shootList[0]).state).toBe(BootstrapStatusEnum.PENDING)
         expect(stats.total).toBe(3)
         expect(stats.successRate).toBe(1)
-        expect(bootstrapper.bootstrapped.size).toBe(3)
-        expect(bootstrapper.isResourceBootstrapped(shootList[1])).toBe(true)
-        expect(bootstrapper.isResourceBootstrapped(shootList[2])).toBe(true)
+        expect(bootstrapper.bootstrapState.size).toBe(4)
+        expect(bootstrapper.bootstrapState.getValueForResource(shootList[1]).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
+        expect(bootstrapper.bootstrapState.getValueForResource(shootList[2]).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
+        expect(bootstrapper.bootstrapState.getValueForResource(shootList[3]).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
       })
 
       it('should not bootstrap shoot cluster', async function () {
@@ -864,13 +866,15 @@ describe('services', function () {
 
         const bootstrapper = new Bootstrapper()
         // bootstrap dummy whose seed does not have .spec.secretRef set
-        bootstrapper.bootstrapResource(shootList[2])
-        await pEvent(bootstrapper, 'empty')
+        const shoot = shootList[2]
+        const { namespace, name } = shoot.metadata
+        bootstrapper.bootstrapResource(shoot)
+        await pEvent(bootstrapper, 'drain')
         const stats = bootstrapper.getStats()
-        expect(bootstrapper.isResourcePending(shootList[0])).toBe(false)
+        expect(bootstrapper.bootstrapState.getValueForResource(shoot).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
         expect(stats.total).toBe(1)
         expect(stats.successRate).toBe(1)
-        expect(logger.info).toBeCalledTimes(1)
+        expect(logger.info).toBeCalledWith(`Bootstrapping Shoot ${namespace}/${name} aborted as 'spec.secretRef' on the seed is missing. In case a shoot is used as seed, add the flag \`with-secret-ref\` to the \`shoot.gardener.cloud/use-as-seed\` annotation`)
       })
 
       it('should not bootstrap unreachable shoot cluster', async function () {
@@ -885,9 +889,9 @@ describe('services', function () {
         const shoot = shootList[3]
         const { namespace, name } = shoot.metadata
         bootstrapper.bootstrapResource(shoot)
-        await pEvent(bootstrapper, 'empty')
+        await pEvent(bootstrapper, 'drain')
         const stats = bootstrapper.getStats()
-        expect(bootstrapper.isResourcePending(shootList[0])).toBe(false)
+        expect(bootstrapper.bootstrapState.getValueForResource(shoot).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
         expect(stats.total).toBe(1)
         expect(stats.successRate).toBe(1)
         expect(logger.debug).toBeCalledWith(`Seed ${unreachableSeedName} is not reachable from the dashboard for shoot ${namespace}/${name}, bootstrapping aborted`)

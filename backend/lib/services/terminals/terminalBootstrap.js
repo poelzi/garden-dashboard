@@ -62,36 +62,35 @@ const BootstrapStatusEnum = {
 // acts as abstract class
 class BootstrapMap extends Map {
   containsResource (resource) {
-    const key = this.keyForResource(resource)
+    const key = this.getKeyForResource(resource)
     return this.has(key)
   }
 
   removeResource (resource) {
-    const key = this.keyForResource(resource)
+    const key = this.getKeyForResource(resource)
     this.delete(key)
   }
 
   addResource (resource, value = {}) {
-    const key = this.keyForResource(resource)
+    const key = this.getKeyForResource(resource)
     this.set(key, value)
     return key
   }
 
-  setSucceeded (key, { revision, seedName }) {
+  setSucceeded (key, { revision }) {
     const value = {
       state: BootstrapStatusEnum.BOOTSTRAPPED,
       revision,
-      seedName
     }
     this.set(key, value)
   }
 
   setFailed (key, doNotRetry = false) {
-    const currentValue = this.valueForKey(key)
+    const currentValue = this.getValue(key)
     const failureCounter = _.get(currentValue, 'failure.counter', 0)
     const value = {
-      ...currentValue,
       state: BootstrapStatusEnum.FAILED,
+      revision: currentValue.revision, // keep previous revision, in case handleDependentShoots needs to be triggered
       failure: {
         date: new Date(),
         counter: failureCounter + 1,
@@ -102,23 +101,23 @@ class BootstrapMap extends Map {
   }
 
   setInProgress (key) {
-    const value = this.valueForKey(key)
+    const value = this.getValue(key)
     value.state = BootstrapStatusEnum.IN_PROGRESS,
     this.set(key, value)
   }
 
   setPending (key) {
-    const value = this.valueForKey(key)
+    const value = this.getValue(key)
     value.state = BootstrapStatusEnum.PENDING,
     this.set(key, value)
   }
 
-  valueForResource (resource) {
-    const key = this.keyForResource(resource)
-    return this.valueForKey(key)
+  getValueForResource (resource) {
+    const key = this.getKeyForResource(resource)
+    return this.getValue(key)
   }
 
-  valueForKey (key) {
+  getValue (key) {
     return this.get(key) || {
       state: BootstrapStatusEnum.INITIAL
     }
@@ -126,7 +125,7 @@ class BootstrapMap extends Map {
 
 }
 class UidKeyBootstrapMap extends BootstrapMap {
-  keyForResource (resource) {
+  getKeyForResource (resource) {
     const { metadata: { uid } } = resource
     return uid
   }
@@ -584,9 +583,11 @@ class Bootstrapper extends Queue {
     const qualifiedName = namespace ? namespace + '/' + name : name
     const description = `${kind} - ${qualifiedName} (${uid})`
 
+    const key = this.bootstrapState.getKeyForResource(resource)
+
     if (!this.isBootstrapKindAllowed(kind)) {
       return {
-        needsBootstrap: false,
+        required: false,
         reason: BootstrapReasonEnum.IRRELEVANT
       }
     }
@@ -594,7 +595,7 @@ class Bootstrapper extends Queue {
     // do not bootstrap if resource is beeing deleted
     if (!_.isEmpty(resource.metadata.deletionTimestamp)) {
       return {
-        needsBootstrap: false,
+        required: false,
         reason: BootstrapReasonEnum.IRRELEVANT
       }
     }
@@ -602,17 +603,17 @@ class Bootstrapper extends Queue {
     const isBootstrapDisabledForResource = _.get(resource, ['metadata', 'annotations', 'dashboard.gardener.cloud/terminal-bootstrap-disabled'], 'false') === 'true'
     if (isBootstrapDisabledForResource) {
       return {
-        needsBootstrap: false,
+        required: false,
         reason: BootstrapReasonEnum.IRRELEVANT
       }
     }
 
-    const value = this.bootstrapState.valueForResource(resource)
+    const value = this.bootstrapState.getValueForResource(resource)
 
     if (value.failure) { // failed previously
       if (value.failure.doNotRetry) {
         return {
-          needsBootstrap: false,
+          required: false,
           reason: BootstrapReasonEnum.IRRELEVANT
         }
       }
@@ -623,7 +624,7 @@ class Bootstrapper extends Queue {
       const needsWait = now.diff(lastFailure) <= multiplier * 60 * 60 * 1000
       if (needsWait) {
         return {
-          needsBootstrap: false,
+          required: false,
           reason: BootstrapReasonEnum.IRRELEVANT
         }
       }
@@ -636,14 +637,20 @@ class Bootstrapper extends Queue {
         this.bootstrapState.setPending(key)
       }
       return {
-        needsBootstrap: false,
+        required: false,
         reason: BootstrapReasonEnum.IRRELEVANT
       }
     }
 
-    if (!value.revision) { // no yet bootstrapped
+    if (!value.revision) { // not yet bootstrapped
+      if (value.state === BootstrapStatusEnum.IN_PROGRESS) { // already running, can ignore
+        return {
+          required: false,
+          reason: BootstrapReasonEnum.IRRELEVANT
+        }
+      }
       return {
-        needsBootstrap: true,
+        required: true,
         reason: BootstrapReasonEnum.NOT_BOOTSTRAPPED
       }
     }
@@ -656,8 +663,12 @@ class Bootstrapper extends Queue {
         break
       }
       case 'Shoot': {
-        const seedName = getSeedNameFromShoot(resource)
-        seed = getSeed(seedName)
+        try {
+          const seedName = getSeedNameFromShoot(resource)
+          seed = getSeed(seedName)
+        } catch (error) { // e.g. CacheExpiredError or no seed assigned to this shoot (yet)
+          // ignore error. Will be handled below in case seed can't be determined
+        }
         break
       }
     }
@@ -666,7 +677,7 @@ class Bootstrapper extends Queue {
       logger.debug(`could not determine seed for ${description}. Failed to bootstrap`)
       this.bootstrapState.setFailed(key)
       return {
-        needsBootstrap: false,
+        required: false,
         reason: BootstrapReasonEnum.IRRELEVANT
       }
     }
@@ -674,14 +685,14 @@ class Bootstrapper extends Queue {
     if (value.revision !== bootstrapRevision(seed)) { // revision changed
       logger.debug(`terminal bootstrap revision changed for ${description}. Needs bootstrap`)
       return {
-        needsBootstrap: true,
+        required: true,
         reason: BootstrapReasonEnum.REVISION_CHANGED
       }
     }
 
     // already bootstrapped
     return {
-      needsBootstrap: false,
+      required: false,
       reason: BootstrapReasonEnum.IRRELEVANT
     }
   }
@@ -692,12 +703,12 @@ class Bootstrapper extends Queue {
     const qualifiedName = namespace ? namespace + '/' + name : name
     const description = `${kind} - ${qualifiedName} (${uid})`
 
-    const { needsBootstrap, reason } = this.bootstrapStatus(resource)
-    if (!needsBootstrap) {
+    const { required, reason } = this.bootstrapStatus(resource)
+    if (!required) {
       return
     }
 
-    const key = this.bootstrapState.keyForResource(resource)
+    const key = this.bootstrapState.getKeyForResource(resource)
     this.bootstrapState.setInProgress(key)
 
     const taskId = taskIdForResource(resource)
@@ -728,12 +739,6 @@ class Bootstrapper extends Queue {
           }
         }
 
-        if (session.canceled) { // do not add key to the bootstrapped set when the session is canceled (due to shoot deletion) to prevent leaking memory
-          logger.debug(`Canceling handler of ${description} as requested after handling resource`)
-          this.bootstrapState.delete(key) // tasks are canceled only for deleted resources, hence remove from state
-          return
-        }
-
         const seed = await getSeedFromCache(kind, name, namespace)
         if (!seed) {
           logger.debug(`failed to get seed after successful bootstrap of ${description}`)
@@ -741,15 +746,23 @@ class Bootstrapper extends Queue {
           return
         }
 
+        if (session.canceled) { // do not add key to the bootstrapped set when the session is canceled (due to shoot deletion) to prevent leaking memory
+          logger.debug(`Canceling handler of ${description} as requested after handling resource`)
+          this.bootstrapState.delete(key) // tasks are canceled only for deleted resources, hence remove from state
+          return
+        }
+
         logger.debug(`Successfully bootstrapped ${description}`)
         const revision = bootstrapRevision(seed)
-        this.bootstrapState.setSucceeded(key, {
-          revision,
-          seedName: seed.metadata.name
-        })
-      } catch (error) {
-        this.bootstrapState.setFailed(key)
-        throw error
+        this.bootstrapState.setSucceeded(key, { revision })
+      } catch (err) {
+        if (session.canceled) { // do not add key to the bootstrapped set when the session is canceled (due to shoot deletion) to prevent leaking memory
+          logger.debug(`Handler canceled of ${description}`)
+          this.bootstrapState.delete(key) // tasks are canceled only for deleted resources, hence remove from state
+        } else {
+          this.bootstrapState.setFailed(key)
+        }
+        throw err
       }
     }
     const handler = new Handler(fn, {
@@ -787,5 +800,6 @@ class Bootstrapper extends Queue {
 
 module.exports = {
   Handler,
-  Bootstrapper
+  Bootstrapper,
+  BootstrapStatusEnum
 }
