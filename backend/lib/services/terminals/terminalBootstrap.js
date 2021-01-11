@@ -80,7 +80,7 @@ class BootstrapMap extends Map {
   setSucceeded (key, { revision }) {
     const value = {
       state: BootstrapStatusEnum.BOOTSTRAPPED,
-      revision,
+      revision
     }
     this.set(key, value)
   }
@@ -102,13 +102,13 @@ class BootstrapMap extends Map {
 
   setInProgress (key) {
     const value = this.getValue(key)
-    value.state = BootstrapStatusEnum.IN_PROGRESS,
+    value.state = BootstrapStatusEnum.IN_PROGRESS
     this.set(key, value)
   }
 
   setPending (key) {
     const value = this.getValue(key)
-    value.state = BootstrapStatusEnum.PENDING,
+    value.state = BootstrapStatusEnum.PENDING
     this.set(key, value)
   }
 
@@ -122,7 +122,6 @@ class BootstrapMap extends Map {
       state: BootstrapStatusEnum.INITIAL
     }
   }
-
 }
 class UidKeyBootstrapMap extends BootstrapMap {
   getKeyForResource (resource) {
