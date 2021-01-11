@@ -45,13 +45,18 @@ const { getSeed } = require('../../cache')
 
 const TERMINAL_KUBE_APISERVER = 'dashboard-terminal-kube-apiserver'
 
-const BootstrapEnum = {
-  SEED_DETERMINATION_FAILED: -3,
-  BOOTSTRAP_IGNORED: -2, // resource excluded from bootstrapping, deleted or not yet ready to be bootstrapped
-  BOOTSTRAP_POSTPONED: -1,
-  BOOTSTRAPPED: 0,
-  BOOTSTRAP_REQUIRED_NOT_YET_BOOTSTRAPPED: 1,
-  BOOTSTRAP_REQUIRED_REVISION_CHANGED: 2
+const BootstrapReasonEnum = {
+  IRRELEVANT: 0,
+  NOT_BOOTSTRAPPED: 1,
+  REVISION_CHANGED: 2
+}
+
+const BootstrapStatusEnum = {
+  INITIAL: 0,
+  PENDING: 1,
+  BOOTSTRAPPED: 2,
+  IN_PROGRESS: 3,
+  FAILED: 4
 }
 
 // acts as abstract class
@@ -66,38 +71,60 @@ class BootstrapMap extends Map {
     this.delete(key)
   }
 
-  removeBy (predicate) {
-    const keysToBeRemoved = _
-      .chain(this)
-      .pickBy(predicate)
-      .keys()
-      .value()
-
-    _.forEach(keysToBeRemoved, key => {
-      this.delete(key)
-    })
-    return keysToBeRemoved
-  }
-
   addResource (resource, value = {}) {
     const key = this.keyForResource(resource)
     this.set(key, value)
     return key
   }
 
+  setSucceeded (key, { revision, seedName }) {
+    const value = {
+      state: BootstrapStatusEnum.BOOTSTRAPPED,
+      revision,
+      seedName
+    }
+    this.set(key, value)
+  }
+
+  setFailed (key, doNotRetry = false) {
+    const currentValue = this.valueForKey(key)
+    const failureCounter = _.get(currentValue, 'failure.counter', 0)
+    const value = {
+      ...currentValue,
+      state: BootstrapStatusEnum.FAILED,
+      failure: {
+        date: new Date(),
+        counter: failureCounter + 1,
+        doNotRetry
+      }
+    }
+    this.set(key, value)
+  }
+
+  setInProgress (key) {
+    const value = this.valueForKey(key)
+    value.state = BootstrapStatusEnum.IN_PROGRESS,
+    this.set(key, value)
+  }
+
+  setPending (key) {
+    const value = this.valueForKey(key)
+    value.state = BootstrapStatusEnum.PENDING,
+    this.set(key, value)
+  }
+
   valueForResource (resource) {
     const key = this.keyForResource(resource)
-    return this.get(key)
+    return this.valueForKey(key)
   }
-}
 
-class NamedKeyBootstrapMap extends BootstrapMap {
-  keyForResource (resource) {
-    const { kind, metadata: { name, namespace } } = resource
-    return `${kind}/${namespace}/${name}`
+  valueForKey (key) {
+    return this.get(key) || {
+      state: BootstrapStatusEnum.INITIAL
+    }
   }
-}
 
+}
 class UidKeyBootstrapMap extends BootstrapMap {
   keyForResource (resource) {
     const { metadata: { uid } } = resource
@@ -502,8 +529,7 @@ function verifyRequiredConfigExists () {
 class Bootstrapper extends Queue {
   constructor () {
     super(Bootstrapper.process, Bootstrapper.options)
-    this.bootstrapPending = new NamedKeyBootstrapMap()
-    this.bootstrapped = new UidKeyBootstrapMap()
+    this.bootstrapState = new UidKeyBootstrapMap()
     this.requiredConfigExists = verifyRequiredConfigExists()
     if (this.isBootstrapKindAllowed('gardenTerminalHost')) {
       const description = 'garden host cluster'
@@ -535,24 +561,13 @@ class Bootstrapper extends Queue {
         break
       }
       case 'MODIFIED': {
-        const status = this.bootstrapStatus(object)
-        const bootstrapRequired =
-          BootstrapEnum.BOOTSTRAP_REQUIRED_NOT_YET_BOOTSTRAPPED === status ||
-           BootstrapEnum.BOOTSTRAP_REQUIRED_REVISION_CHANGED === status
-        if (bootstrapRequired) {
-          this.bootstrapResourceWithStatus(object, status)
-        }
+        this.bootstrapResource(object)
         break
       }
       case 'DELETED': {
         this.cancelTask(object)
 
-        if (this.isResourcePending(object)) {
-          this.removePendingResource(object)
-        }
-        if (this.isResourceBootstrapped(object)) {
-          this.removeBootstrappedResource(object)
-        }
+        this.bootstrapState.removeResource(object)
         break
       }
     }
@@ -563,50 +578,74 @@ class Bootstrapper extends Queue {
     this.cancel(taskId)
   }
 
-  isResourceBootstrapped (resource) {
-    return this.bootstrapped.containsResource(resource)
-  }
-
-  removeBootstrappedResource (resource) {
-    return this.bootstrapped.removeResource(resource)
-  }
-
-  isResourcePending (resource) {
-    return this.bootstrapPending.containsResource(resource)
-  }
-
-  removePendingResource (resource) {
-    return this.bootstrapPending.removeResource(resource)
-  }
-
   bootstrapStatus (resource) {
-    const { kind } = resource
+    const { kind, metadata: { namespace, name, uid } } = resource
+
+    const qualifiedName = namespace ? namespace + '/' + name : name
+    const description = `${kind} - ${qualifiedName} (${uid})`
 
     if (!this.isBootstrapKindAllowed(kind)) {
-      return BootstrapEnum.BOOTSTRAP_IGNORED
+      return {
+        needsBootstrap: false,
+        reason: BootstrapReasonEnum.IRRELEVANT
+      }
     }
 
     // do not bootstrap if resource is beeing deleted
     if (!_.isEmpty(resource.metadata.deletionTimestamp)) {
-      return BootstrapEnum.BOOTSTRAP_IGNORED
+      return {
+        needsBootstrap: false,
+        reason: BootstrapReasonEnum.IRRELEVANT
+      }
     }
 
     const isBootstrapDisabledForResource = _.get(resource, ['metadata', 'annotations', 'dashboard.gardener.cloud/terminal-bootstrap-disabled'], 'false') === 'true'
     if (isBootstrapDisabledForResource) {
-      return BootstrapEnum.BOOTSTRAP_IGNORED
+      return {
+        needsBootstrap: false,
+        reason: BootstrapReasonEnum.IRRELEVANT
+      }
+    }
+
+    const value = this.bootstrapState.valueForResource(resource)
+
+    if (value.failure) { // failed previously
+      if (value.failure.doNotRetry) {
+        return {
+          needsBootstrap: false,
+          reason: BootstrapReasonEnum.IRRELEVANT
+        }
+      }
+
+      const lastFailure = moment(value.failure.date)
+      const now = moment(new Date())
+      const multiplier = Math.min(value.failure.counter * 2, 24)
+      const needsWait = now.diff(lastFailure) <= multiplier * 60 * 60 * 1000
+      if (needsWait) {
+        return {
+          needsBootstrap: false,
+          reason: BootstrapReasonEnum.IRRELEVANT
+        }
+      }
     }
 
     // for shoots, if the seed-shoot-ns does not exist, postpone bootstrapping
     if (kind === 'Shoot' && !seedShootNamespaceExists(resource)) {
-      if (this.bootstrapPending.containsResource(resource)) {
-        return BootstrapEnum.BOOTSTRAP_IGNORED
+      if (value.state === BootstrapStatusEnum.INITIAL) {
+        logger.debug(`bootstrapping of ${description} postponed`)
+        this.bootstrapState.setPending(key)
       }
-      return BootstrapEnum.BOOTSTRAP_POSTPONED
+      return {
+        needsBootstrap: false,
+        reason: BootstrapReasonEnum.IRRELEVANT
+      }
     }
 
-    const value = this.bootstrapped.valueForResource(resource)
-    if (!value || !value.revision) {
-      return BootstrapEnum.BOOTSTRAP_REQUIRED_NOT_YET_BOOTSTRAPPED
+    if (!value.revision) { // no yet bootstrapped
+      return {
+        needsBootstrap: true,
+        reason: BootstrapReasonEnum.NOT_BOOTSTRAPPED
+      }
     }
 
     // determine seed
@@ -624,102 +663,94 @@ class Bootstrapper extends Queue {
     }
 
     if (!seed) {
-      return BootstrapEnum.SEED_DETERMINATION_FAILED
+      logger.debug(`could not determine seed for ${description}. Failed to bootstrap`)
+      this.bootstrapState.setFailed(key)
+      return {
+        needsBootstrap: false,
+        reason: BootstrapReasonEnum.IRRELEVANT
+      }
     }
 
-    if (value.revision !== bootstrapRevision(seed)) {
-      return BootstrapEnum.BOOTSTRAP_REQUIRED_REVISION_CHANGED
+    if (value.revision !== bootstrapRevision(seed)) { // revision changed
+      logger.debug(`terminal bootstrap revision changed for ${description}. Needs bootstrap`)
+      return {
+        needsBootstrap: true,
+        reason: BootstrapReasonEnum.REVISION_CHANGED
+      }
     }
 
-    return BootstrapEnum.BOOTSTRAPPED
+    // already bootstrapped
+    return {
+      needsBootstrap: false,
+      reason: BootstrapReasonEnum.IRRELEVANT
+    }
   }
 
-  bootstrapResource (resource, status) {
+  bootstrapResource (resource) {
     const { kind, metadata: { namespace, name, uid } } = resource
 
     const qualifiedName = namespace ? namespace + '/' + name : name
     const description = `${kind} - ${qualifiedName} (${uid})`
 
-    if (!status) {
-      status = this.bootstrapStatus(resource)
-    }
-    switch (status) {
-      case BootstrapEnum.BOOTSTRAP_IGNORED:
-        return // skip
-      case BootstrapEnum.SEED_DETERMINATION_FAILED:
-        logger.debug(`could not determine seed for ${description}. Failed to bootstrap`)
-        return // skip
-      case BootstrapEnum.BOOTSTRAPPED:
-        logger.debug(`terminal bootstrap already executed for ${description}`)
-        return // skip
-      case BootstrapEnum.BOOTSTRAP_POSTPONED:
-        this.bootstrapPending.addResource(resource)
-        logger.debug(`bootstrapping of ${description} postponed`)
-        return // skip
-      case BootstrapEnum.BOOTSTRAP_REQUIRED_REVISION_CHANGED:
-        logger.debug(`terminal bootstrap revision changed for ${description}. Needs bootstrap`)
-
-        if (kind === 'Seed') {
-          const removed = this.bootstrapped.removeBy(['seedName', name])
-          logger.debug(`Cleared ${removed.length} bootstrapped resources related to seed ${name}`)
-        }
-        break // continue
-      case BootstrapEnum.BOOTSTRAP_REQUIRED_NOT_YET_BOOTSTRAPPED:
-        break // continue
-      default:
-        logger.debug(`unknown bootstrap status ${status}`)
-        return // skip
+    const { needsBootstrap, reason } = this.bootstrapStatus(resource)
+    if (!needsBootstrap) {
+      return
     }
 
-    if (this.bootstrapPending.containsResource(resource)) {
-      this.bootstrapPending.removeResource(resource)
-    }
+    const key = this.bootstrapState.keyForResource(resource)
+    this.bootstrapState.setInProgress(key)
 
-    const key = this.bootstrapped.keyForResource(resource)
-    const bootstrapPendingKey = this.bootstrapPending.keyForResource(resource)
     const taskId = taskIdForResource(resource)
     const fn = async session => {
-      if (session.canceled) {
-        logger.debug(`Canceling handler of ${description} as requested`)
-        return
-      }
-
-      switch (kind) {
-        case 'Seed': {
-          await handleSeed({ name })
-          if (BootstrapEnum.BOOTSTRAP_REQUIRED_REVISION_CHANGED === status) {
-            await handleDependentShoots({ name }, this)
-          }
-          break
-        }
-        case 'Shoot': {
-          await handleShoot({ name, namespace })
-          break
-        }
-        default: {
-          logger.error(`can't bootstrap unsupported kind ${kind}`)
+      try {
+        if (session.canceled) {
+          logger.debug(`Canceling handler of ${description} as requested`)
+          this.bootstrapState.delete(key) // tasks are canceled only for deleted resources, hence remove from state
           return
         }
-      }
 
-      if (session.canceled) { // do not add key to the bootstrapped set when the session is canceled (due to shoot deletion) to prevent leaking memory
-        logger.debug(`Canceling handler of ${description} as requested after handling resource`)
-        return
-      }
+        switch (kind) {
+          case 'Seed': {
+            await handleSeed({ name })
+            if (reason === BootstrapReasonEnum.REVISION_CHANGED) {
+              await handleDependentShoots({ name }, this)
+            }
+            break
+          }
+          case 'Shoot': {
+            await handleShoot({ name, namespace })
+            break
+          }
+          default: {
+            logger.error(`can't bootstrap unsupported kind ${kind}`)
+            this.bootstrapState.setFailed(key, true)
+            return
+          }
+        }
 
-      const seed = await getSeedFromCache(kind, name, namespace)
-      if (!seed) {
-        logger.debug(`failed to get seed after successful bootstrap of ${description}`)
-        return
-      }
+        if (session.canceled) { // do not add key to the bootstrapped set when the session is canceled (due to shoot deletion) to prevent leaking memory
+          logger.debug(`Canceling handler of ${description} as requested after handling resource`)
+          this.bootstrapState.delete(key) // tasks are canceled only for deleted resources, hence remove from state
+          return
+        }
 
-      logger.debug(`Successfully bootstrapped ${description}`)
-      const revision = bootstrapRevision(seed)
-      this.bootstrapped.set(key, {
-        revision,
-        seedName: seed.metadata.name
-      })
-      this.bootstrapPending.delete(bootstrapPendingKey)
+        const seed = await getSeedFromCache(kind, name, namespace)
+        if (!seed) {
+          logger.debug(`failed to get seed after successful bootstrap of ${description}`)
+          this.bootstrapState.setFailed(key)
+          return
+        }
+
+        logger.debug(`Successfully bootstrapped ${description}`)
+        const revision = bootstrapRevision(seed)
+        this.bootstrapState.setSucceeded(key, {
+          revision,
+          seedName: seed.metadata.name
+        })
+      } catch (error) {
+        this.bootstrapState.setFailed(key)
+        throw error
+      }
     }
     const handler = new Handler(fn, {
       id: taskId, // with the id we make sure that the task for one shoot is not added multiple times (e.g. on another ADDED event when the shoot watch is re-established)
