@@ -93,7 +93,7 @@ describe('watches', function () {
   })
 
   describe('seeds', function () {
-    const kind = 'Seeds'
+    const kind = 'Seed'
     const { seeds } = dashboardClient['core.gardener.cloud']
 
     it('should watch seeds', async function () {
@@ -320,7 +320,7 @@ describe('watches', function () {
 
       expect(logger.error).toBeCalledTimes(1)
       expect(removeResourceStub).toBeCalledTimes(2)
-      expect(removeResourceStub.mock.calls).toEqual([[foobar], [foobaz]]) // foobar??
+      expect(removeResourceStub.mock.calls).toEqual([[foobar], [foobaz]])
       expect(deleteTicketsStub).toBeCalledTimes(2)
 
       expect(fooRoom.events).toHaveLength(0)

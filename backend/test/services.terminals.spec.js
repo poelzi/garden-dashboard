@@ -810,6 +810,7 @@ describe('services', function () {
         const stats = bootstrapper.getStats()
         expect(stats.total).toBe(1)
         expect(stats.successRate).toBe(1)
+        expect(bootstrapper.bootstrapState.getValueForResource(seed).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
       })
 
       it('should skip bootstrap of unreachable seed cluster', async function () {
@@ -848,13 +849,16 @@ describe('services', function () {
         }
         await pEvent(bootstrapper, 'drain')
         const stats = bootstrapper.getStats()
-        expect(bootstrapper.bootstrapState.getValueForResource(shootList[0]).state).toBe(BootstrapStatusEnum.PENDING)
         expect(stats.total).toBe(3)
         expect(stats.successRate).toBe(1)
         expect(bootstrapper.bootstrapState.size).toBe(4)
-        expect(bootstrapper.bootstrapState.getValueForResource(shootList[1]).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
-        expect(bootstrapper.bootstrapState.getValueForResource(shootList[2]).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
-        expect(bootstrapper.bootstrapState.getValueForResource(shootList[3]).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
+        const state = _.map(shootList, shoot => bootstrapper.bootstrapState.getValueForResource(shoot).state)
+        expect(state).toEqual([
+          BootstrapStatusEnum.PENDING,
+          BootstrapStatusEnum.BOOTSTRAPPED,
+          BootstrapStatusEnum.BOOTSTRAPPED,
+          BootstrapStatusEnum.BOOTSTRAPPED
+        ])
       })
 
       it('should not bootstrap shoot cluster', async function () {
