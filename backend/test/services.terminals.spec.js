@@ -16,6 +16,7 @@ const logger = require('../lib/logger')
 const config = require('../lib/config')
 const { getSeed, cache } = require('../lib/cache')
 const { encodeBase64 } = require('../lib/utils')
+const { parseFieldSelector } = require('../__fixtures__/helper')
 
 const {
   ensureTerminalAllowed,
@@ -141,12 +142,13 @@ describe('services', function () {
 
     const terminalConfig = config.terminal
     let terminalStub
+    let seedList
 
     beforeEach(function () {
       terminalStub = jest.fn().mockReturnValue(terminalConfig)
       Object.defineProperty(config, 'terminal', { get: terminalStub })
-      jest.spyOn(cache, 'getCloudProfiles').mockReturnValue(fixtures.cloudprofiles.list())
-      jest.spyOn(cache, 'getSeeds').mockReturnValue(fixtures.seeds.list())
+      seedList = fixtures.seeds.list()
+      jest.spyOn(cache, 'getSeeds').mockImplementation(() => seedList)
     })
 
     afterEach(function () {
@@ -734,6 +736,23 @@ describe('services', function () {
                 .find({ metadata: { namespace, name } })
                 .cloneDeep()
                 .value()
+            },
+            async listAllNamespaces (query) {
+              await nextTick()
+
+              const fieldSelector = parseFieldSelector(query.fieldSelector)
+              const items = _
+                .chain(shootList)
+                .filter(fieldSelector)
+                .map(shoot => {
+                  _.unset(shoot, 'kind')
+                  return shoot
+                })
+                .value()
+              return {
+                kind: 'ShootList',
+                items
+              }
             }
           }
         })
@@ -811,6 +830,44 @@ describe('services', function () {
         expect(stats.total).toBe(1)
         expect(stats.successRate).toBe(1)
         expect(bootstrapper.bootstrapState.getValueForResource(seed).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
+      })
+
+      it('should bootstrap a seed cluster after revision changed', async function () {
+        const gardenTerminalHost = {
+          seedRef: seedName
+        }
+        const bootstrap = {
+          disabled: false,
+          shootDisabled: false,
+          seedDisabled: false
+        }
+        terminalStub.mockReturnValue(createTerminalConfig({ gardenTerminalHost, bootstrap }))
+        const seed = _.find(seedList, ['metadata.name', seedName])
+        _.set(seed, 'metadata.annotations["seed.gardener.cloud/ingress-class"]', 'foo')
+        const bootstrapper = new Bootstrapper()
+        bootstrapper.bootstrapResource(seed)
+        await pEvent(bootstrapper, 'drain')
+        const revision = bootstrapper.bootstrapState.getValueForResource(seed).revision
+        let shootState = _.map(shootList, shoot => bootstrapper.bootstrapState.getValueForResource(shoot).state)
+        expect(shootState).toEqual([
+          BootstrapStatusEnum.INITIAL,
+          BootstrapStatusEnum.INITIAL,
+          BootstrapStatusEnum.INITIAL,
+          BootstrapStatusEnum.INITIAL
+        ])
+        _.set(seed, 'metadata.annotations["seed.gardener.cloud/ingress-class"]', 'bar') // the bootstrap revision will change
+        bootstrapper.bootstrapResource(seed)
+        await pEvent(bootstrapper, 'drain')
+        const seedValue = bootstrapper.bootstrapState.getValueForResource(seed)
+        expect(seedValue.state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
+        expect(seedValue.revision).not.toBe(revision)
+        shootState = _.map(shootList, shoot => bootstrapper.bootstrapState.getValueForResource(shoot).state)
+        expect(shootState).toEqual([
+          BootstrapStatusEnum.PENDING, // postponed
+          BootstrapStatusEnum.BOOTSTRAPPED,
+          BootstrapStatusEnum.INITIAL,
+          BootstrapStatusEnum.INITIAL
+        ])
       })
 
       it('should skip bootstrap of unreachable seed cluster', async function () {
