@@ -609,6 +609,13 @@ class Bootstrapper extends Queue {
 
     const value = this.bootstrapState.getValueForResource(resource)
 
+    if (value.state === BootstrapStatusEnum.IN_PROGRESS) { // task already running or in queue, can ignore
+      return {
+        required: false,
+        reason: BootstrapReasonEnum.IRRELEVANT
+      }
+    }
+
     if (value.failure) { // failed previously
       if (value.failure.doNotRetry) {
         return {
@@ -642,12 +649,6 @@ class Bootstrapper extends Queue {
     }
 
     if (!value.revision) { // not yet bootstrapped
-      if (value.state === BootstrapStatusEnum.IN_PROGRESS) { // already running, can ignore
-        return {
-          required: false,
-          reason: BootstrapReasonEnum.IRRELEVANT
-        }
-      }
       return {
         required: true,
         reason: BootstrapReasonEnum.NOT_BOOTSTRAPPED
