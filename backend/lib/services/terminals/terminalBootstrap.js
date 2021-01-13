@@ -41,8 +41,6 @@ const {
   GardenTerminalHostRefType
 } = require('./utils')
 
-const { getSeed } = require('../../cache')
-
 const TERMINAL_KUBE_APISERVER = 'dashboard-terminal-kube-apiserver'
 
 const BootstrapReasonEnum = {
@@ -77,6 +75,17 @@ class BootstrapMap extends Map {
     const value = {
       state: BootstrapStatusEnum.BOOTSTRAPPED,
       revision
+    }
+    this.set(key, value)
+  }
+
+  setBootstrapRequired (item) {
+    const key = this.getKey(item)
+    const currentValue = this.getValue(key)
+    const value = {
+      state: BootstrapStatusEnum.INITIAL,
+      revision: undefined, // reset revision
+      failure: currentValue.failure // keep failure in case there is any
     }
     this.set(key, value)
   }
@@ -144,7 +153,7 @@ function bootstrapRevision (seed) {
 
   const ingressClass = _.get(seed, 'metadata.annotations["seed.gardener.cloud/ingress-class"]')
   const ingressDomain = getSeedIngressDomain(seed)
-  const trigger = _.get(seed, 'metadata.labels.["dashboard.gardener.cloud/terminal-bootstrap-trigger"]')
+  const trigger = _.get(seed, 'metadata.annotations.["dashboard.gardener.cloud/terminal-bootstrap-trigger"]')
 
   const revisionObj = {
     ingressClass,
@@ -628,38 +637,13 @@ class Bootstrapper extends Queue {
       }
     }
 
-    // determine seed
-    let seed
-    switch (kind) {
-      case 'Seed': {
-        seed = resource
-        break
-      }
-      case 'Shoot': {
-        try {
-          const seedName = getSeedNameFromShoot(resource)
-          seed = getSeed(seedName)
-        } catch (error) { // e.g. CacheExpiredError or no seed assigned to this shoot (yet)
-          // ignore error. Will be handled below in case seed can't be determined
+    if (kind === 'Seed') {
+      if (value.revision !== bootstrapRevision(resource)) { // revision changed
+        logger.debug(`terminal bootstrap revision changed for ${description}. Needs bootstrap`)
+        return {
+          required: true,
+          reason: BootstrapReasonEnum.REVISION_CHANGED
         }
-        break
-      }
-    }
-
-    if (!seed) {
-      logger.debug(`could not determine seed for ${description}. Failed to bootstrap`)
-      this.bootstrapState.setFailed(resource)
-      return {
-        required: false,
-        reason: BootstrapReasonEnum.IRRELEVANT
-      }
-    }
-
-    if (value.revision !== bootstrapRevision(seed)) { // revision changed
-      logger.debug(`terminal bootstrap revision changed for ${description}. Needs bootstrap`)
-      return {
-        required: true,
-        reason: BootstrapReasonEnum.REVISION_CHANGED
       }
     }
 
@@ -748,8 +732,10 @@ class Bootstrapper extends Queue {
       fieldSelector: `spec.seedName=${seedName}`
     }
     const { items } = await dashboardClient['core.gardener.cloud'].shoots.listAllNamespaces(query)
+    logger.debug(`Bootstrap required for ${items.length} shoots due to terminal bootstrap revision change`)
     _.forEach(items, shoot => {
       shoot.kind = 'Shoot' // patch missing kind
+      this.bootstrapState.setBootstrapRequired(shoot)
       this.bootstrapResource(shoot)
     })
   }

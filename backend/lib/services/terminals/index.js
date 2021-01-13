@@ -754,15 +754,4 @@ async function listShortcuts ({ user, namespace }) {
   }
 }
 
-async function resumeBootstrapperAfterCacheSynchronization (bootstrapper) {
-  await cache.cache.synchronizationPromise
-  logger.debug('terminal bootstrapper resumed')
-  bootstrapper.resume()
-}
-
-const bootstrapper = new Bootstrapper()
-bootstrapper.pause()
-
-resumeBootstrapperAfterCacheSynchronization(bootstrapper)
-
-exports.bootstrapper = bootstrapper
+exports.bootstrapper = new Bootstrapper()

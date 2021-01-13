@@ -868,6 +868,7 @@ describe('services', function () {
           BootstrapStatusEnum.INITIAL,
           BootstrapStatusEnum.INITIAL
         ])
+        expect(logger.debug).toBeCalledWith(`Bootstrap required for 2 shoots due to terminal bootstrap revision change`)
       })
 
       it('should skip bootstrap of unreachable seed cluster', async function () {
