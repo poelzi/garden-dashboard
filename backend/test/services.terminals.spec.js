@@ -16,7 +16,6 @@ const logger = require('../lib/logger')
 const config = require('../lib/config')
 const { getSeed, cache } = require('../lib/cache')
 const { encodeBase64 } = require('../lib/utils')
-const { parseFieldSelector } = require('../__fixtures__/helper')
 
 const {
   ensureTerminalAllowed,
@@ -148,7 +147,7 @@ describe('services', function () {
       terminalStub = jest.fn().mockReturnValue(terminalConfig)
       Object.defineProperty(config, 'terminal', { get: terminalStub })
       seedList = fixtures.seeds.list()
-      jest.spyOn(cache, 'getSeeds').mockImplementation(() => seedList)
+      jest.spyOn(cache, 'getSeeds').mockReturnValue(seedList)
     })
 
     afterEach(function () {
@@ -740,14 +739,11 @@ describe('services', function () {
             async listAllNamespaces (query) {
               await nextTick()
 
-              const fieldSelector = parseFieldSelector(query.fieldSelector)
+              const fieldSelector = fixtures.helper.parseFieldSelector(query.fieldSelector)
               const items = _
                 .chain(shootList)
                 .filter(fieldSelector)
-                .map(shoot => {
-                  _.unset(shoot, 'kind')
-                  return shoot
-                })
+                .tap(shoot => (delete shoot.kind))
                 .value()
               return {
                 kind: 'ShootList',
