@@ -13,7 +13,7 @@ const fnv = require('fnv-plus')
 const {
   getConfigValue,
   getSeedNameFromShoot,
-  seedIngressDomain
+  getSeedIngressDomain
 } = require('../../utils')
 
 const assert = require('assert').strict
@@ -105,17 +105,17 @@ function getKubeApiServerHostForShoot (shoot, seed) {
   }
   const { namespace, name } = shoot.metadata
   const hash = fnv.hash(`${name}.${namespace}`, 32).str()
-  const ingressDomain = seedIngressDomain(seed)
+  const ingressDomain = getSeedIngressDomain(seed)
   return `k-${hash}.${ingressDomain}`
 }
 
 function getKubeApiServerHostForSeed (seed) {
-  const ingressDomain = seedIngressDomain(seed)
+  const ingressDomain = getSeedIngressDomain(seed)
   return `k-g.${ingressDomain}`
 }
 
 function getWildcardIngressDomainForSeed (seed) {
-  const ingressDomain = seedIngressDomain(seed)
+  const ingressDomain = getSeedIngressDomain(seed)
   return `*.${ingressDomain}`
 }
 

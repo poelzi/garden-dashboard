@@ -43,7 +43,7 @@ function shootHasIssue (shoot) {
   return _.get(shoot, ['metadata', 'labels', 'shoot.gardener.cloud/status'], 'healthy') !== 'healthy'
 }
 
-function seedIngressDomain (seed) {
+function getSeedIngressDomain (seed) {
   return _.get(seed, 'spec.dns.ingressDomain') || _.get(seed, 'spec.ingress.domain')
 }
 
@@ -62,5 +62,5 @@ module.exports = {
   getSeedNameFromShoot,
   shootHasIssue,
   isSeedUnreachable,
-  seedIngressDomain
+  getSeedIngressDomain
 }

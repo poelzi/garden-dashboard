@@ -23,7 +23,7 @@ const {
   getConfigValue,
   getSeedNameFromShoot,
   isSeedUnreachable,
-  seedIngressDomain
+  getSeedIngressDomain
 } = require('../../utils')
 
 const {
@@ -154,7 +154,7 @@ function bootstrapRevision (seed) {
   }
 
   const ingressClass = _.get(seed, 'metadata.annotations["seed.gardener.cloud/ingress-class"]')
-  const ingressDomain = seedIngressDomain(seed)
+  const ingressDomain = getSeedIngressDomain(seed)
   const trigger = _.get(seed, 'metadata.labels.["dashboard.gardener.cloud/terminal-bootstrap-trigger"]')
 
   const revisionObj = {

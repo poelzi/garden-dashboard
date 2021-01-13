@@ -775,6 +775,10 @@ describe('services', function () {
         Object.defineProperty(dashboardClient, 'core.gardener.cloud', { value: coreGardenerCloud })
       })
 
+      function statesForResources (resources, bootstrapper) {
+        return _.map(resources, resource => bootstrapper.bootstrapState.getValueForResource(resource).state)
+      }
+
       it('should not bootstrap anything', async function () {
         const bootstrap = {
           disabled: true
@@ -825,7 +829,7 @@ describe('services', function () {
         const stats = bootstrapper.getStats()
         expect(stats.total).toBe(1)
         expect(stats.successRate).toBe(1)
-        expect(bootstrapper.bootstrapState.getValueForResource(seed).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
+        expect(statesForResources([seed], bootstrapper)).toEqual([BootstrapStatusEnum.BOOTSTRAPPED])
       })
 
       it('should bootstrap a seed cluster after revision changed', async function () {
@@ -844,8 +848,8 @@ describe('services', function () {
         bootstrapper.bootstrapResource(seed)
         await pEvent(bootstrapper, 'drain')
         const revision = bootstrapper.bootstrapState.getValueForResource(seed).revision
-        let shootState = _.map(shootList, shoot => bootstrapper.bootstrapState.getValueForResource(shoot).state)
-        expect(shootState).toEqual([
+        let shootStates = statesForResources(shootList, bootstrapper)
+        expect(shootStates).toEqual([
           BootstrapStatusEnum.INITIAL,
           BootstrapStatusEnum.INITIAL,
           BootstrapStatusEnum.INITIAL,
@@ -857,8 +861,8 @@ describe('services', function () {
         const seedValue = bootstrapper.bootstrapState.getValueForResource(seed)
         expect(seedValue.state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
         expect(seedValue.revision).not.toBe(revision)
-        shootState = _.map(shootList, shoot => bootstrapper.bootstrapState.getValueForResource(shoot).state)
-        expect(shootState).toEqual([
+        shootStates = statesForResources(shootList, bootstrapper)
+        expect(shootStates).toEqual([
           BootstrapStatusEnum.PENDING, // postponed
           BootstrapStatusEnum.BOOTSTRAPPED,
           BootstrapStatusEnum.INITIAL,
@@ -905,8 +909,8 @@ describe('services', function () {
         expect(stats.total).toBe(3)
         expect(stats.successRate).toBe(1)
         expect(bootstrapper.bootstrapState.size).toBe(4)
-        const state = _.map(shootList, shoot => bootstrapper.bootstrapState.getValueForResource(shoot).state)
-        expect(state).toEqual([
+        const shootStates = statesForResources(shootList, bootstrapper)
+        expect(shootStates).toEqual([
           BootstrapStatusEnum.PENDING,
           BootstrapStatusEnum.BOOTSTRAPPED,
           BootstrapStatusEnum.BOOTSTRAPPED,
@@ -928,7 +932,7 @@ describe('services', function () {
         bootstrapper.bootstrapResource(shoot)
         await pEvent(bootstrapper, 'drain')
         const stats = bootstrapper.getStats()
-        expect(bootstrapper.bootstrapState.getValueForResource(shoot).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
+        expect(statesForResources([shoot], bootstrapper)).toEqual([BootstrapStatusEnum.BOOTSTRAPPED])
         expect(stats.total).toBe(1)
         expect(stats.successRate).toBe(1)
         expect(logger.info).toBeCalledWith(`Bootstrapping Shoot ${namespace}/${name} aborted as 'spec.secretRef' on the seed is missing. In case a shoot is used as seed, add the flag \`with-secret-ref\` to the \`shoot.gardener.cloud/use-as-seed\` annotation`)
@@ -948,7 +952,7 @@ describe('services', function () {
         bootstrapper.bootstrapResource(shoot)
         await pEvent(bootstrapper, 'drain')
         const stats = bootstrapper.getStats()
-        expect(bootstrapper.bootstrapState.getValueForResource(shoot).state).toBe(BootstrapStatusEnum.BOOTSTRAPPED)
+        expect(statesForResources([shoot], bootstrapper)).toEqual([BootstrapStatusEnum.BOOTSTRAPPED])
         expect(stats.total).toBe(1)
         expect(stats.successRate).toBe(1)
         expect(logger.debug).toBeCalledWith(`Seed ${unreachableSeedName} is not reachable from the dashboard for shoot ${namespace}/${name}, bootstrapping aborted`)
