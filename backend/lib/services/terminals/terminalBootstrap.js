@@ -53,7 +53,7 @@ const BootstrapReasonEnum = {
 
 const BootstrapStatusEnum = {
   INITIAL: 0,
-  PENDING: 1,
+  POSTPONED: 1,
   BOOTSTRAPPED: 2,
   IN_PROGRESS: 3,
   FAILED: 4
@@ -61,11 +61,6 @@ const BootstrapStatusEnum = {
 
 // acts as abstract class
 class BootstrapMap extends Map {
-  containsResource (resource) {
-    const key = this.getKeyForResource(resource)
-    return this.has(key)
-  }
-
   removeResource (resource) {
     const key = this.getKeyForResource(resource)
     this.delete(key)
@@ -77,7 +72,8 @@ class BootstrapMap extends Map {
     return key
   }
 
-  setSucceeded (key, { revision }) {
+  setSucceeded (item, { revision }) {
+    const key = this.getKey(item)
     const value = {
       state: BootstrapStatusEnum.BOOTSTRAPPED,
       revision
@@ -85,7 +81,8 @@ class BootstrapMap extends Map {
     this.set(key, value)
   }
 
-  setFailed (key, doNotRetry = false) {
+  setFailed (item, doNotRetry = false) {
+    const key = this.getKey(item)
     const currentValue = this.getValue(key)
     const failureCounter = _.get(currentValue, 'failure.counter', 0)
     const value = {
@@ -100,27 +97,32 @@ class BootstrapMap extends Map {
     this.set(key, value)
   }
 
-  setInProgress (key) {
+  setInProgress (item) {
+    const key = this.getKey(item)
     const value = this.getValue(key)
     value.state = BootstrapStatusEnum.IN_PROGRESS
     this.set(key, value)
   }
 
-  setPending (key) {
+  setPostponed (item) {
+    const key = this.getKey(item)
     const value = this.getValue(key)
-    value.state = BootstrapStatusEnum.PENDING
+    value.state = BootstrapStatusEnum.POSTPONED
     this.set(key, value)
   }
 
-  getValueForResource (resource) {
-    const key = this.getKeyForResource(resource)
-    return this.getValue(key)
-  }
-
-  getValue (key) {
+  getValue (item) {
+    const key = this.getKey(item)
     return this.get(key) || {
       state: BootstrapStatusEnum.INITIAL
     }
+  }
+
+  getKey (arg) {
+    if (typeof arg === 'string') {
+      return arg
+    }
+    return this.getKeyForResource(arg)
   }
 }
 class UidKeyBootstrapMap extends BootstrapMap {
@@ -133,19 +135,6 @@ class UidKeyBootstrapMap extends BootstrapMap {
 function taskIdForResource (resource) {
   const { metadata: { uid } } = resource
   return uid
-}
-
-async function getSeedFromCache (kind, name, namespace) {
-  switch (kind) {
-    case 'Seed': {
-      return getSeed(name)
-    }
-    case 'Shoot': {
-      const shootResource = await dashboardClient['core.gardener.cloud'].shoots.get(namespace, name)
-      const seedName = getSeedNameFromShoot(shootResource)
-      return getSeed(seedName)
-    }
-  }
 }
 
 function bootstrapRevision (seed) {
@@ -295,24 +284,11 @@ function replaceServiceKubeApiServer (client, { name = TERMINAL_KUBE_APISERVER, 
   return replaceResource(client.core.services, { namespace, name, body })
 }
 
-async function handleDependentShoots ({ name }, bootstrapper) {
-  const query = {
-    fieldSelector: `spec.seedName=${name}`
-  }
-  const { items } = await dashboardClient['core.gardener.cloud'].shoots.listAllNamespaces(query)
-  _.forEach(items, shoot => {
-    shoot.kind = 'Shoot' // patch missing kind
-    bootstrapper.bootstrapResource(shoot)
-  })
-}
-
-async function handleSeed ({ name }) {
+async function handleSeed (seed) {
+  const { metadata: { name, deletionTimestamp } } = seed
   const namespace = 'garden'
 
-  // get latest seed resource from cache
-  const seed = getSeed(name)
-
-  if (!_.isEmpty(seed.metadata.deletionTimestamp)) {
+  if (!_.isEmpty(deletionTimestamp)) {
     logger.debug(`Seed ${name} is marked for deletion, bootstrapping aborted`)
     return
   }
@@ -326,17 +302,18 @@ async function handleSeed ({ name }) {
   // now make sure a browser-trusted certificate is presented for the kube-apiserver
   const shoot = await dashboardClient.getShoot({ namespace, name, throwNotFound: false })
   if (shoot) {
-    await ensureTrustedCertForShootApiServer(dashboardClient, shoot)
+    const seedName = getSeedNameFromShoot(shoot)
+    const seedForShoot = await dashboardClient['core.gardener.cloud'].seeds.get(seedName)
+    await ensureTrustedCertForShootApiServer(dashboardClient, shoot, seedForShoot)
   } else {
     await ensureTrustedCertForSeedApiServer(dashboardClient, seed)
   }
 }
 
-async function handleShoot ({ name, namespace }) {
+async function handleShoot (shoot, seed) {
+  const { metadata: { namespace, name } } = shoot
   logger.debug(`replacing shoot's apiserver ingress ${namespace}/${name} for webterminals`)
-  // read the latest shoot resource version
-  const latestShootResource = await dashboardClient['core.gardener.cloud'].shoots.get(namespace, name)
-  await ensureTrustedCertForShootApiServer(dashboardClient, latestShootResource)
+  await ensureTrustedCertForShootApiServer(dashboardClient, shoot, seed)
 }
 
 /*
@@ -346,16 +323,14 @@ async function handleShoot ({ name, namespace }) {
   Until this is the case we need to workaround this by creating an ingress (e.g. with the respective certmanager annotations) so that a proper certificate is presented for the kube-apiserver.
   https://github.com/gardener/gardener/issues/1413
 */
-async function ensureTrustedCertForShootApiServer (client, shootResource) {
-  const { metadata: { namespace, name } } = shootResource
-  if (!_.isEmpty(shootResource.metadata.deletionTimestamp)) {
+async function ensureTrustedCertForShootApiServer (client, shootResource, seedResource) {
+  const { metadata: { namespace, name, deletionTimestamp } } = shootResource
+  if (!_.isEmpty(deletionTimestamp)) {
     logger.debug(`Shoot ${namespace}/${name} is marked for deletion, bootstrapping aborted`)
     return
   }
 
-  // fetch seed resource
-  const seedName = getSeedNameFromShoot(shootResource)
-  const seedResource = await client['core.gardener.cloud'].seeds.get(seedName)
+  const seedName = seedResource.metadata.name
 
   if (isSeedUnreachable(seedResource)) {
     logger.debug(`Seed ${seedName} is not reachable from the dashboard for shoot ${namespace}/${name}, bootstrapping aborted`)
@@ -582,8 +557,6 @@ class Bootstrapper extends Queue {
     const qualifiedName = namespace ? namespace + '/' + name : name
     const description = `${kind} - ${qualifiedName} (${uid})`
 
-    const key = this.bootstrapState.getKeyForResource(resource)
-
     if (!this.isBootstrapKindAllowed(kind)) {
       return {
         required: false,
@@ -607,7 +580,7 @@ class Bootstrapper extends Queue {
       }
     }
 
-    const value = this.bootstrapState.getValueForResource(resource)
+    const value = this.bootstrapState.getValue(resource)
 
     if (value.state === BootstrapStatusEnum.IN_PROGRESS) { // task already running or in queue, can ignore
       return {
@@ -640,7 +613,7 @@ class Bootstrapper extends Queue {
     if (kind === 'Shoot' && !seedShootNamespaceExists(resource)) {
       if (value.state === BootstrapStatusEnum.INITIAL) {
         logger.debug(`bootstrapping of ${description} postponed`)
-        this.bootstrapState.setPending(key)
+        this.bootstrapState.setPostponed(resource)
       }
       return {
         required: false,
@@ -675,7 +648,7 @@ class Bootstrapper extends Queue {
 
     if (!seed) {
       logger.debug(`could not determine seed for ${description}. Failed to bootstrap`)
-      this.bootstrapState.setFailed(key)
+      this.bootstrapState.setFailed(resource)
       return {
         required: false,
         reason: BootstrapReasonEnum.IRRELEVANT
@@ -720,16 +693,21 @@ class Bootstrapper extends Queue {
           return
         }
 
+        let seed
         switch (kind) {
           case 'Seed': {
-            await handleSeed({ name })
+            seed = await dashboardClient['core.gardener.cloud'].seeds.get(name)
+            await handleSeed(seed)
             if (reason === BootstrapReasonEnum.REVISION_CHANGED) {
-              await handleDependentShoots({ name }, this)
+              await this.handleDependentShoots(name)
             }
             break
           }
           case 'Shoot': {
-            await handleShoot({ name, namespace })
+            const shoot = await dashboardClient['core.gardener.cloud'].shoots.get(namespace, name)
+            const seedName = getSeedNameFromShoot(shoot)
+            seed = await dashboardClient['core.gardener.cloud'].seeds.get(seedName)
+            await handleShoot(shoot, seed)
             break
           }
           default: {
@@ -737,13 +715,6 @@ class Bootstrapper extends Queue {
             this.bootstrapState.setFailed(key, true)
             return
           }
-        }
-
-        const seed = await getSeedFromCache(kind, name, namespace)
-        if (!seed) {
-          logger.debug(`failed to get seed after successful bootstrap of ${description}`)
-          this.bootstrapState.setFailed(key)
-          return
         }
 
         if (session.canceled) { // do not add key to the bootstrapped set when the session is canceled (due to shoot deletion) to prevent leaking memory
@@ -770,6 +741,17 @@ class Bootstrapper extends Queue {
       description
     })
     this.push(handler)
+  }
+
+  async handleDependentShoots (seedName) {
+    const query = {
+      fieldSelector: `spec.seedName=${seedName}`
+    }
+    const { items } = await dashboardClient['core.gardener.cloud'].shoots.listAllNamespaces(query)
+    _.forEach(items, shoot => {
+      shoot.kind = 'Shoot' // patch missing kind
+      this.bootstrapResource(shoot)
+    })
   }
 
   static get options () {
