@@ -13,7 +13,6 @@ const config = require('../../config')
 
 const { Forbidden, UnprocessableEntity } = require('http-errors')
 const { isHttpError } = require('@gardener-dashboard/request')
-const cache = require('../../cache')
 
 const {
   decodeBase64,
