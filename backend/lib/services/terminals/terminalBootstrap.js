@@ -60,12 +60,12 @@ const BootstrapStatusEnum = {
 // acts as abstract class
 class BootstrapMap extends Map {
   removeResource (resource) {
-    const key = this.getKeyForResource(resource)
+    const key = this.getKey(resource)
     this.delete(key)
   }
 
   addResource (resource, value = {}) {
-    const key = this.getKeyForResource(resource)
+    const key = this.getKey(resource)
     this.set(key, value)
     return key
   }
@@ -131,12 +131,8 @@ class BootstrapMap extends Map {
     if (typeof arg === 'string') {
       return arg
     }
-    return this.getKeyForResource(arg)
-  }
-}
-class UidKeyBootstrapMap extends BootstrapMap {
-  getKeyForResource (resource) {
-    const { metadata: { uid } } = resource
+
+    const { metadata: { uid } } = arg
     return uid
   }
 }
@@ -511,7 +507,7 @@ function verifyRequiredConfigExists () {
 class Bootstrapper extends Queue {
   constructor () {
     super(Bootstrapper.process, Bootstrapper.options)
-    this.bootstrapState = new UidKeyBootstrapMap()
+    this.bootstrapState = new BootstrapMap()
     this.requiredConfigExists = verifyRequiredConfigExists()
     if (this.isBootstrapKindAllowed('gardenTerminalHost')) {
       const description = 'garden host cluster'
@@ -665,7 +661,7 @@ class Bootstrapper extends Queue {
       return
     }
 
-    const key = this.bootstrapState.getKeyForResource(resource)
+    const key = this.bootstrapState.getKey(resource)
     this.bootstrapState.setInProgress(key)
 
     const taskId = taskIdForResource(resource)
