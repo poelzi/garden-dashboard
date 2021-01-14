@@ -153,7 +153,7 @@ function bootstrapRevision (seed) {
 
   const ingressClass = _.get(seed, 'metadata.annotations["seed.gardener.cloud/ingress-class"]')
   const ingressDomain = getSeedIngressDomain(seed)
-  const trigger = _.get(seed, 'metadata.annotations.["dashboard.gardener.cloud/terminal-bootstrap-trigger"]')
+  const trigger = _.get(seed, 'metadata.annotations["dashboard.gardener.cloud/terminal-bootstrap-trigger"]')
 
   const revisionObj = {
     ingressClass,
@@ -297,7 +297,7 @@ async function handleSeed (seed) {
   const { metadata: { name, deletionTimestamp } } = seed
   const namespace = 'garden'
 
-  if (!_.isEmpty(deletionTimestamp)) {
+  if (deletionTimestamp) {
     logger.debug(`Seed ${name} is marked for deletion, bootstrapping aborted`)
     return
   }
@@ -334,7 +334,7 @@ async function handleShoot (shoot, seed) {
 */
 async function ensureTrustedCertForShootApiServer (client, shootResource, seedResource) {
   const { metadata: { namespace, name, deletionTimestamp } } = shootResource
-  if (!_.isEmpty(deletionTimestamp)) {
+  if (deletionTimestamp) {
     logger.debug(`Shoot ${namespace}/${name} is marked for deletion, bootstrapping aborted`)
     return
   }
